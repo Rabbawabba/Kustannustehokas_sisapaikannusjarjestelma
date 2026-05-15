@@ -1,0 +1,55 @@
+import socket
+import time
+
+************************
+Hyödyntäkää jetsonin koodia lähettämään koordinaatit
+************************
+
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5006
+
+LAT = 61.4978
+LON = 23.7610
+
+LON_STEP = 0.0005   # liikkuu näkyvästi kartalla
+INTERVAL = 1.0
+
+def checksum(sentence: str) -> str:
+    csum = 0
+    for ch in sentence:
+        csum ^= ord(ch)
+    return f"{csum:02X}"
+
+def decimal_to_nmea_lat(lat: float):
+    degrees = int(lat)
+    minutes = (lat - degrees) * 60
+    return f"{degrees:02d}{minutes:07.4f}", "N" if lat >= 0 else "S"
+
+def decimal_to_nmea_lon(lon: float):
+    degrees = int(lon)
+    minutes = (lon - degrees) * 60
+    return f"{degrees:03d}{minutes:07.4f}", "E" if lon >= 0 else "W"
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+step = 0
+direction = 1
+
+while True:
+    current_lon = LON + step * LON_STEP * direction
+
+    lat_nmea, lat_dir = decimal_to_nmea_lat(LAT)
+    lon_nmea, lon_dir = decimal_to_nmea_lon(current_lon)
+
+    body = f"GPGGA,123519,{lat_nmea},{lat_dir},{lon_nmea},{lon_dir},1,08,0.9,121.5,M,0.0,M,,"
+    msg = f"${body}*{checksum(body)}"
+
+    sock.sendto(msg.encode("ascii"), (UDP_IP, UDP_PORT))
+    print("sent:", msg)
+
+    step += 1
+    if step >= 20:
+        step = 0
+        direction *= -1
+
+    time.sleep(INTERVAL)

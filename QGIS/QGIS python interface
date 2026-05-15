@@ -1,0 +1,134 @@
+import socket
+from qgis.PyQt.QtCore import QTimer
+from qgis.core import (
+    QgsVectorLayer,
+    QgsFeature,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProject,
+    QgsField
+)
+from PyQt5.QtCore import QVariant
+
+# --------------------------------------------------
+# 1. Pysäytä vanhat oliot jos niitä on olemassa
+# --------------------------------------------------
+try:
+    gps_timer.stop()
+    print("Vanha timer pysäytetty")
+except:
+    pass
+
+try:
+    gps_sock.close()
+    print("Vanha socket suljettu")
+except:
+    pass
+
+# --------------------------------------------------
+# 2. Poista vanha taso jos se on jo projektissa
+# --------------------------------------------------
+project = QgsProject.instance()
+for layer in list(project.mapLayers().values()):
+    if layer.name() == "Live GPS UDP":
+        project.removeMapLayer(layer.id())
+
+# --------------------------------------------------
+# 3. UDP-asetukset
+# --------------------------------------------------
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5006
+
+gps_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+gps_sock.bind((UDP_IP, UDP_PORT))
+gps_sock.setblocking(False)
+
+# --------------------------------------------------
+# 4. Luo muistitaso
+# --------------------------------------------------
+layer = QgsVectorLayer("Point?crs=EPSG:4326", "Live GPS UDP", "memory")
+provider = layer.dataProvider()
+provider.addAttributes([QgsField("name", QVariant.String)])
+layer.updateFields()
+
+# Aloituspiste Tampere
+start_lon = 23.7610
+start_lat = 61.4978
+
+feat = QgsFeature(layer.fields())
+feat["name"] = "UDP GPS"
+feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(start_lon, start_lat)))
+provider.addFeature(feat)
+
+QgsProject.instance().addMapLayer(layer)
+
+iface.mapCanvas().setExtent(layer.extent())
+iface.mapCanvas().refresh()
+
+# --------------------------------------------------
+# 5. NMEA -> desimaalimuunnos
+# --------------------------------------------------
+def nmea_to_decimal(coord, direction, is_lon=False):
+    if not coord:
+        raise ValueError("Tyhjä koordinaatti")
+
+    deg_len = 3 if is_lon else 2
+
+    degrees = int(coord[:deg_len])
+    minutes = float(coord[deg_len:])
+    decimal = degrees + minutes / 60.0
+
+    if direction in ["S", "W"]:
+        decimal *= -1
+
+    return decimal
+
+# --------------------------------------------------
+# 6. Päivitysfunktio
+# --------------------------------------------------
+def update():
+    global feat
+
+    try:
+        data, _ = gps_sock.recvfrom(1024)
+        msg = data.decode("ascii").strip()
+    except BlockingIOError:
+        return
+    except Exception as e:
+        print("Socket-virhe:", e)
+        return
+
+    if not msg.startswith("$GPGGA"):
+        return
+
+    parts = msg.split(",")
+
+    if len(parts) < 6:
+        print("Virheellinen NMEA:", msg)
+        return
+
+    try:
+        lat = nmea_to_decimal(parts[2], parts[3], is_lon=False)
+        lon = nmea_to_decimal(parts[4], parts[5], is_lon=True)
+    except Exception as e:
+        print("Muunnosvirhe:", e)
+        return
+
+    layer.startEditing()
+    feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+    layer.updateFeature(feat)
+    layer.commitChanges()
+
+    layer.triggerRepaint()
+    iface.mapCanvas().refresh()
+
+    print(f"Päivitetty: lat={lat:.6f}, lon={lon:.6f}")
+
+# --------------------------------------------------
+# 7. Käynnistä timer
+# --------------------------------------------------
+gps_timer = QTimer()
+gps_timer.timeout.connect(update)
+gps_timer.start(500)
+
+print(f"Live GPS UDP käynnissä portissa {UDP_PORT}")

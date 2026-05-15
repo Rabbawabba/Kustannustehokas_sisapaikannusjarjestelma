@@ -1,0 +1,332 @@
+/*
+  Copyright 2025 Lenni Kiviniemi and Samu Heinonen
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+*/
+
+/*
+==============================================================================
+  ESP32-S3 UWB Tag Firmware for MaUWB DW3000
+  UDP Streaming with Kalman Filter & Adaptive Offset Correction
+==============================================================================
+
+   Project Overview:
+  - This firmware configures an ESP32-S3 as a UWB Tag using the MaUWB DW3000.
+  - It receives ranging data from anchors and applies per-anchor Kalman filtering.
+  - Adaptive offset correction improves short- and long-range accuracy.
+  - The filtered distance data is transmitted over UDP to a remote server
+    (e.g., Jetson or Raspberry Pi) for processing or visualization.
+  - OLED display shows tag ID and system information for field debugging.
+
+   Key Features:
+  - UWB module configured as Tag via AT+SETCFG
+  - Real-time Kalman filtering with per-anchor state
+  - Adaptive offset correction based on range threshold (<2.5m = 30cm, ≥2.5m = 50cm)
+  - UDP client stream to specified host and port
+  - OLED-based local feedback for UWB role and connected anchors
+
+   Hardware Configuration:
+  - Microcontroller: ESP32-S3
+  - UWB Module: MaUWB DW3000 via HardwareSerial2 (TXD: 17, RXD: 18)
+  - Display: SSD1306 OLED via I2C (SDA: GPIO 39, SCL: GPIO 38)
+  - Reset Pin: GPIO 16
+
+   Network Configuration:
+  - WiFi SSID: "EB-Akatemia25"
+  - UDP Host: 192.168.1.102
+  - Port: 5000
+
+   UWB & Kalman Configuration:
+  - UWB_INDEX: Tag device ID
+  - UWB_TAG_COUNT: Number of anchors expected
+  - Kalman Parameters (per anchor):
+      - Estimate: 0.0
+      - Error Covariance: 1.0
+      - Process Noise: 0.01
+      - Measurement Noise: 0.5
+
+   Dependencies:
+  - Wire v2.0.0
+  - Adafruit GFX Library v1.11.7
+  - Adafruit SSD1306 v2.5.7
+  - Adafruit BusIO v1.14.4
+  - SPI v2.0.0
+
+   Author: Lenni Kiviniemi and Samu Heinonen
+   Last Updated: 2025-03-31
+==============================================================================
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+
+// User config ------------------------------------------
+#define UWB_INDEX 0  // Tag ID
+#define TAG
+#define UWB_TAG_COUNT 5  // Adjust based on actual number of anchors
+// User config end --------------------------------------
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>  //Use WiFiUdp instead of WiFiClient
+
+// User config ------------------------------------------
+#define UWB_INDEX 0
+#define TAG
+#define UWB_TAG_COUNT 5
+// User config end --------------------------------------
+
+#define SERIAL_LOG Serial
+#define SERIAL_AT mySerial2
+HardwareSerial SERIAL_AT(2);
+
+#define RESET 16
+#define IO_RXD2 18
+#define IO_TXD2 17
+#define I2C_SDA 39
+#define I2C_SCL 38
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+String response = "";
+String rec_head = "AT+RANGE";
+
+// WiFi and UDP config
+const char* ssid = "EB-Akatemia25";
+const char* password = "EbAkatemia25";
+const char* host = "192.168.1.101";
+const uint16_t port = 5000;
+WiFiUDP udp;  //WiFiUDP instead of WiFiClient
+
+// Kalman Filter Struct
+struct KalmanFilter
+{
+    float estimate;
+    float error_cov;
+    float process_noise;
+    float measurement_noise;
+};
+
+KalmanFilter kalmanFilters[UWB_TAG_COUNT];
+
+void initializeKalman()
+{
+    for (int i = 0; i < UWB_TAG_COUNT; i++)
+    {
+        kalmanFilters[i].estimate = 0.0;
+        kalmanFilters[i].error_cov = 1.0;
+        kalmanFilters[i].process_noise = 0.01;
+        kalmanFilters[i].measurement_noise = 0.5;
+    }
+}
+
+float kalmanUpdate(KalmanFilter &kf, float measurement)
+{
+    float correction = (measurement < 250) ? 30.0 : 50.0; // tässä on filtteri 0-250cm = 30cm korjaus ja yli 250cm = 50cm korjaus
+    measurement -= correction;
+
+    kf.error_cov += kf.process_noise;
+
+    float kalman_gain = kf.error_cov / (kf.error_cov + kf.measurement_noise);
+    kf.estimate += kalman_gain * (measurement - kf.estimate);
+    kf.error_cov *= (1 - kalman_gain);
+
+    return kf.estimate;
+}
+
+void setup()
+{
+    pinMode(RESET, OUTPUT);
+    digitalWrite(RESET, HIGH);
+
+    SERIAL_LOG.begin(115200);
+    SERIAL_LOG.println(F("ESP32-S3 UWB Tag Initialized"));
+
+    WiFi.begin(ssid, password);
+    SERIAL_LOG.print("Connecting to WiFi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        SERIAL_LOG.print(".");
+    }
+    SERIAL_LOG.println("Connected!");
+
+    // No UDP connection needed (connectionless), just start the object
+    udp.begin(port);
+    SERIAL_LOG.println("UDP client ready");
+
+    SERIAL_AT.begin(115200, SERIAL_8N1, IO_RXD2, IO_TXD2);
+    SERIAL_AT.println("AT");
+    Wire.begin(I2C_SDA, I2C_SCL);
+
+    delay(1000);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        SERIAL_LOG.println(F("SSD1306 display failed"));
+        for (;;);
+    }
+    display.clearDisplay();
+    logoshow();
+
+    sendData("AT?", 2000, 1);
+    sendData("AT+RESTORE", 5000, 1);
+    sendData(config_cmd(), 2000, 1);
+    sendData(cap_cmd(), 2000, 1);
+    sendData("AT+SETRPT=1", 2000, 1);
+    sendData("AT+SAVE", 2000, 1);
+    sendData("AT+RESTART", 2000, 1);
+
+    initializeKalman();
+}
+
+void loop()
+{
+    // UDP is connectionless – no need to reconnect
+    while (SERIAL_AT.available() > 0)
+    {
+        char c = SERIAL_AT.read();
+        if (c == '\r')
+            continue;
+        else if (c == '\n' || c == '\r')
+        {
+            if (response.indexOf(rec_head) != -1)
+            {
+                processRangeData(response);
+            }
+            response = "";
+        }
+        else
+        {
+            response += c;
+        }
+    }
+}
+
+void processRangeData(String data)
+{
+    SERIAL_LOG.println(F("\n Received UWB Data:"));
+    SERIAL_LOG.println(data);
+
+    String id_str = data.substring(data.indexOf("tid:") + 4, data.indexOf(",mask:"));
+    String range_str = data.substring(data.indexOf("range:"), data.indexOf(",rssi:"));
+
+    int range_list[8];
+    int count = sscanf(range_str.c_str(), "range:(%d,%d,%d,%d,%d,%d,%d,%d)",
+                       &range_list[0], &range_list[1], &range_list[2], &range_list[3],
+                       &range_list[4], &range_list[5], &range_list[6], &range_list[7]);
+
+    if (count != 8)
+    {
+        SERIAL_LOG.println(F(" ERROR: Failed to parse range data"));
+        return;
+    }
+
+    SERIAL_LOG.print(F(" TAG ")); SERIAL_LOG.print(id_str);
+    SERIAL_LOG.println(F(" distances to anchors:"));
+
+    for (int i = 0; i < UWB_TAG_COUNT; i++)
+    {
+        SERIAL_LOG.print(" Anchor A"); SERIAL_LOG.print(i);
+        SERIAL_LOG.print(" Raw Distance: ");
+
+        if (range_list[i] > 0)
+        {
+            float correction = (range_list[i] < 250) ? 30.0 : 50.0; // tässä on filtteri 0-250cm = 30cm korjaus ja yli 250cm = 50cm korjaus
+            float filtered_distance = kalmanUpdate(kalmanFilters[i], range_list[i]);
+
+            SERIAL_LOG.print(range_list[i]); 
+            SERIAL_LOG.print(" cm | Correction: ");
+            SERIAL_LOG.print(correction);
+            SERIAL_LOG.print(" cm | Filtered (Corrected): ");
+            SERIAL_LOG.print(filtered_distance);
+            SERIAL_LOG.println(" cm");
+
+            //  Send via UDP
+            String message = "A" + String(i) + ":" + String(filtered_distance) + "cm\n";
+            udp.beginPacket(host, port);
+            udp.print(message);
+            udp.endPacket();
+        }
+        else
+        {
+            SERIAL_LOG.println(" No Signal");
+        }
+    }
+}
+
+void logoshow(void)
+{
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("MaUWB DW3000"));
+
+    display.setTextSize(2);
+    display.setCursor(0, 20);
+    display.print(F("T"));
+    display.print(UWB_INDEX);
+    display.print(F("  6.8M"));
+    display.setCursor(0, 40);
+    display.print(F("Total: "));
+    display.print(UWB_TAG_COUNT);
+
+    display.display();
+    delay(1000);
+}
+
+String sendData(String command, const int timeout, boolean debug)
+{
+    String response = "";
+    SERIAL_LOG.println(command);
+    SERIAL_AT.println(command);
+    long int time = millis();
+
+    while ((time + timeout) > millis())
+    {
+        while (SERIAL_AT.available())
+        {
+            char c = SERIAL_AT.read();
+            response += c;
+        }
+    }
+
+    if (debug)
+        SERIAL_LOG.println(response);
+
+    return response;
+}
+
+String config_cmd()
+{
+    String temp = "AT+SETCFG=";
+    temp += UWB_INDEX;
+    temp += ",0";
+    temp += ",1";
+    temp += ",1";
+    return temp;
+}
+
+String cap_cmd()
+{
+    String temp = "AT+SETCAP=";
+    temp += UWB_TAG_COUNT;
+    temp += ",10";
+    temp += ",0";
+    return temp;
+}
